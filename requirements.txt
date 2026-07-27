@@ -1,0 +1,16 @@
+# Versiones FIJADAS a proposito.
+#
+# Sin el "==", pip instala la ultima version disponible el dia que corras el
+# comando. Eso significa que vos y un companero pueden terminar con versiones
+# distintas, y que este proyecto puede dejar de andar dentro de seis meses sin
+# que nadie haya tocado una linea de codigo.
+#
+# Fijar versiones es la diferencia entre "en mi maquina anda" y "anda".
+# Para actualizar a proposito: cambias el numero y corres los tests.
+
+fastapi==0.124.4
+uvicorn[standard]==0.38.0
+
+# Solo para correr los tests
+pytest==9.0.2
+httpx==0.28.1
