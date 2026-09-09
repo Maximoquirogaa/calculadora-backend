@@ -6,9 +6,12 @@ TestClient de FastAPI llama a la aplicacion directamente en memoria, asi que
 corren rapido y no dependen de que haya un puerto libre.
 """
 
+from datetime import datetime, timezone
+
 import pytest
 from fastapi.testclient import TestClient
 
+import db
 import main
 from main import app
 
@@ -248,3 +251,149 @@ def test_healthcheck():
 
     assert respuesta.status_code == 200
     assert respuesta.json()["estado"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Historial — la persistencia es OPCIONAL
+# ---------------------------------------------------------------------------
+# Estos tests corren sin ninguna base de datos levantada, y eso no es una
+# limitacion: es exactamente lo que queremos verificar. La API tiene que
+# funcionar entera con la base caida o inexistente.
+#
+# Fijate que ni siquiera hace falta un Postgres en la integracion continua.
+# Esa comodidad es consecuencia directa de haber diseñado la persistencia como
+# opcional, no de una casualidad.
+
+
+class PoolRoto:
+    """Un pool que revienta apenas alguien le pide una conexion."""
+
+    def connection(self):
+        raise RuntimeError("la base se cayo (simulado a proposito)")
+
+
+def test_sin_base_de_datos_el_healthcheck_lo_declara():
+    respuesta = client.get("/api/salud")
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["persistencia"] is False
+
+
+def test_sin_base_de_datos_el_historial_da_503_y_no_lista_vacia():
+    # La diferencia importa. Una lista vacia significa "todavia no calculaste
+    # nada". Un 503 significa "esta funcionalidad no esta disponible en este
+    # servidor". Son dos situaciones distintas y el cliente tiene que poder
+    # distinguirlas.
+    respuesta = client.get("/api/historial")
+
+    assert respuesta.status_code == 503
+    assert "detail" in respuesta.json()
+
+
+def test_la_calculadora_sigue_calculando_con_la_base_caida(monkeypatch):
+    # ESTE es el test que justifica todo el diseño de db.py.
+    #
+    # La base explota en cada intento de guardar, y la cuenta tiene que salir
+    # igual, con un 200 y el resultado correcto. Guardar el historial es una
+    # funcionalidad SECUNDARIA: no puede tumbar a la principal.
+    monkeypatch.setattr(db, "_pool", PoolRoto())
+
+    respuesta = client.post("/api/calcular", json={"a": 6, "b": 7, "operacion": "multiplicacion"})
+
+    assert respuesta.status_code == 200
+    assert respuesta.json()["resultado"] == 42
+
+
+def test_guardar_nunca_lanza_aunque_la_base_falle(monkeypatch):
+    # El contrato de db.guardar() es "no lanza nunca". Lo verificamos directo,
+    # sin pasar por la API: si esta funcion algun dia deja de tragarse los
+    # errores, este test lo caza antes que el usuario.
+    monkeypatch.setattr(db, "_pool", PoolRoto())
+
+    db.guardar(
+        a=1, b=2, operacion="suma", simbolo="+", resultado=3.0, expresion="1.0 + 2.0 = 3.0"
+    )
+
+
+def test_con_base_el_historial_devuelve_las_operaciones(monkeypatch):
+    # Simulamos que hay persistencia sin levantar ningun Postgres: reemplazamos
+    # las dos funciones que main.py le pide al modulo db.
+    #
+    # Esto se puede hacer limpio porque main.py nunca habla con la base
+    # directamente: le habla a db. Esa frontera es lo que hace testeable al
+    # endpoint.
+    fila = {
+        "a": 10.0,
+        "b": 4.0,
+        "operacion": "division",
+        "simbolo": "/",
+        "resultado": 2.5,
+        "expresion": "10.0 / 4.0 = 2.5",
+        "creado_en": datetime(2026, 7, 27, 12, 0, 0, tzinfo=timezone.utc),
+    }
+
+    monkeypatch.setattr(db, "hay_persistencia", lambda: True)
+    monkeypatch.setattr(db, "listar", lambda limite: [fila])
+
+    respuesta = client.get("/api/historial")
+
+    assert respuesta.status_code == 200
+    cuerpo = respuesta.json()
+    assert len(cuerpo) == 1
+    assert cuerpo[0]["expresion"] == "10.0 / 4.0 = 2.5"
+
+
+def test_el_historial_respeta_el_limite_pedido(monkeypatch):
+    # Segundo caso, con otro valor, para que no alcance con devolver una
+    # constante. Verificamos que el limite llega efectivamente hasta db.listar.
+    recibidos = {}
+
+    def listar_espia(limite):
+        recibidos["limite"] = limite
+        return []
+
+    monkeypatch.setattr(db, "hay_persistencia", lambda: True)
+    monkeypatch.setattr(db, "listar", listar_espia)
+
+    client.get("/api/historial?limite=25")
+
+    assert recibidos["limite"] == 25
+
+
+def test_si_la_base_se_cae_en_caliente_el_historial_da_503_y_no_500(monkeypatch):
+    # El caso que no cubre ninguno de los tests de arriba, y que en produccion
+    # es el MAS probable de todos.
+    #
+    # La API arranco con la base andando, asi que el pool existe y
+    # hay_persistencia() dice True. Despues, en algun momento, la base se cae.
+    # Ahora db.listar() lanza — y si esa excepcion subiera, el cliente recibe
+    # un 500: "algo se rompio y no se que".
+    #
+    # Y eso es mentira. La API esta perfecta, entiende el pedido, y no puede
+    # cumplirlo porque una dependencia no esta. Eso es un 503, exactamente
+    # igual que cuando no hay base configurada. La causa cambia; lo que el
+    # cliente necesita saber, no.
+    def listar_que_revienta(limite):
+        raise RuntimeError("la base se cayo despues de arrancar (simulado)")
+
+    monkeypatch.setattr(db, "hay_persistencia", lambda: True)
+    monkeypatch.setattr(db, "listar", listar_que_revienta)
+
+    respuesta = client.get("/api/historial")
+
+    assert respuesta.status_code == 503
+    assert "detail" in respuesta.json()
+
+
+@pytest.mark.parametrize("limite", [0, -5, 101, 999999999])
+def test_el_historial_rechaza_limites_fuera_de_rango(limite, monkeypatch):
+    # Sin tope, alguien pide limite=999999999 y se lleva puesta la memoria del
+    # proceso. Es la misma regla de siempre: nunca confies en el cliente.
+    #
+    # Y fijate que la validacion ocurre ANTES de tocar la base: el 422 sale sin
+    # que db.listar llegue a ejecutarse nunca.
+    monkeypatch.setattr(db, "hay_persistencia", lambda: True)
+
+    respuesta = client.get(f"/api/historial?limite={limite}")
+
+    assert respuesta.status_code == 422

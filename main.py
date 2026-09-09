@@ -18,19 +18,46 @@ import math
 import os
 import traceback
 from collections.abc import Callable
+from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+import db
+
+
+# ---------------------------------------------------------------------------
+# Ciclo de vida de la aplicacion
+# ---------------------------------------------------------------------------
+# Todo lo que esta ANTES del yield corre una vez al arrancar; lo que esta
+# DESPUES, una vez al apagar. Es el lugar correcto para abrir y cerrar
+# recursos caros y compartidos: una conexion a una base, un cliente HTTP, una
+# cola.
+#
+# ¿Por que aca y no adentro del endpoint? Porque el endpoint corre una vez por
+# pedido. Abrir el pool de conexiones en cada request seria pagar el costo mas
+# alto de toda la operacion, miles de veces por dia, sin ningun motivo.
+#
+# Y fijate que db.iniciar() NO revienta si la base no esta: la API arranca
+# igual, sin historial. Mira el comentario de db.py para el por que.
+@asynccontextmanager
+async def ciclo_de_vida(app: FastAPI):
+    db.iniciar()
+    yield
+    db.cerrar()
+
+
 app = FastAPI(
     title="Calculadora API",
-    description="API didactica de 4 operaciones. Sin persistencia, sin estado.",
-    version="2.0.0",
+    description="API didactica de 4 operaciones. Historial opcional en Postgres.",
+    version="3.0.0",
+    lifespan=ciclo_de_vida,
 )
 
 # ---------------------------------------------------------------------------
@@ -233,6 +260,35 @@ class OperacionResponse(BaseModel):
     expresion: str
 
 
+class ItemHistorial(BaseModel):
+    """Una fila del historial, tal como sale de la base."""
+
+    a: float
+    b: float
+    operacion: str
+    simbolo: str
+    resultado: float
+    expresion: str
+    creado_en: datetime
+
+
+class SaludResponse(BaseModel):
+    """
+    Estado del servicio Y DE SUS DEPENDENCIAS.
+
+    Un healthcheck que solo dice "estoy vivo" sirve para poco: un proceso puede
+    estar perfectamente vivo y no poder hacer nada util porque la base que
+    necesita esta caida. El healthcheck que sirve es el que declara de que
+    depende y como esta cada cosa.
+
+    Esta es la URL que va a consultar el monitoreo cada treinta segundos el dia
+    que haya monitoreo.
+    """
+
+    estado: str
+    persistencia: bool
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -279,20 +335,98 @@ def calcular(datos: OperacionRequest) -> OperacionResponse:
             ),
         )
 
+    expresion = f"{datos.a} {simbolo} {datos.b} = {resultado}"
+
+    # El guardado va DESPUES de que la cuenta salio bien, y no puede fallar
+    # hacia afuera: db.guardar() se traga cualquier error y lo manda al log.
+    #
+    # Fijate en el orden y en el contrato. La respuesta al usuario ya esta
+    # decidida en este punto. Si la base esta caida, el usuario recibe su
+    # resultado igual y ni se entera. Si en cambio esta linea pudiera lanzar
+    # una excepcion, una calculadora perfectamente funcional devolveria un 500
+    # por no poder escribir una fila que a nadie le urge.
+    db.guardar(
+        a=datos.a,
+        b=datos.b,
+        operacion=datos.operacion,
+        simbolo=simbolo,
+        resultado=resultado,
+        expresion=expresion,
+    )
+
     return OperacionResponse(
         a=datos.a,
         b=datos.b,
         operacion=datos.operacion,
         simbolo=simbolo,
         resultado=resultado,
-        expresion=f"{datos.a} {simbolo} {datos.b} = {resultado}",
+        expresion=expresion,
     )
 
 
-@app.get("/api/salud", tags=["infra"])
-def salud() -> dict[str, str]:
+@app.get("/api/historial", response_model=list[ItemHistorial], tags=["calculadora"])
+def historial(
+    limite: int = Query(10, ge=1, le=100, description="Cuantas operaciones traer"),
+) -> list[ItemHistorial]:
+    """
+    Ultimas operaciones guardadas, de la mas reciente a la mas vieja.
+
+    Sin base de datos configurada esto devuelve un 503, no una lista vacia. La
+    diferencia importa: una lista vacia significa "todavia no calculaste nada",
+    y un 503 significa "esta funcionalidad no esta disponible en este
+    servidor". Son dos situaciones distintas y el cliente tiene que poder
+    distinguirlas.
+
+    503 es ademas el codigo correcto y no un 500: el servidor no se rompio,
+    simplemente hay un servicio del que depende que no esta.
+
+    El parametro `limite` esta acotado con ge/le. Sin ese tope, alguien pide
+    limite=999999999 y se lleva puesta la memoria del proceso. Es la misma idea
+    que en el README: nunca confies en el cliente.
+    """
+    if not db.hay_persistencia():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "El historial no esta disponible: esta API se esta ejecutando "
+                "sin base de datos configurada."
+            ),
+        )
+
+    # Y aca el caso que la linea de arriba NO cubre, y que en produccion es el
+    # mas probable de los dos: la API arranco con la base andando —por eso
+    # hay_persistencia() dice que si— y la base se cayo DESPUES.
+    #
+    # Sin este try, esa excepcion sube hasta la red de seguridad y el cliente
+    # se lleva un 500, o sea "algo se rompio y no se que". Y es mentira: la
+    # API esta perfecta, entiende el pedido, y no puede cumplirlo porque una
+    # dependencia se cayo. Eso es un 503, igual que arriba. Cambia la causa;
+    # lo que el cliente necesita saber, no.
+    #
+    # Fijate la diferencia con db.guardar(), que se traga el error en silencio
+    # y no le avisa a nadie. ¿Por que aca si avisamos y alla no? Porque son
+    # dos pedidos distintos. Alla el usuario pidio una CUENTA y la cuenta
+    # salio bien; el guardado es un efecto secundario que no pidio. Aca el
+    # usuario pidio EL HISTORIAL, y si no se lo podemos dar hay que decirselo.
+    try:
+        filas = db.listar(limite)
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "El historial no esta disponible en este momento: no se pudo "
+                "consultar la base de datos. Probá de nuevo en un rato."
+            ),
+        )
+
+    return [ItemHistorial(**fila) for fila in filas]
+
+
+@app.get("/api/salud", response_model=SaludResponse, tags=["infra"])
+def salud() -> SaludResponse:
     """Healthcheck. Sirve para saber si la API esta viva sin hacer una cuenta."""
-    return {"estado": "ok"}
+    return SaludResponse(estado="ok", persistencia=db.hay_persistencia())
 
 
 # Y aca se termina el backend.

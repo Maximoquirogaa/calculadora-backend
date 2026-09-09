@@ -1,0 +1,45 @@
+# Integracion continua: correr los tests en cada push y en cada pull request.
+#
+# Hasta ahora, cualquier push a main llegaba a produccion sin que nadie
+# ejecutara las pruebas. Un cambio roto se deployaba igual.
+#
+# Este archivo hace que una maquina limpia clone el repositorio, instale las
+# dependencias desde cero y corra los tests. Cada vez. Sin acordarse.
+#
+# OJO: esto SOLO informa. Para que ademas BLOQUEE la integracion hay que
+# activar la proteccion de rama en GitHub:
+#     Settings -> Branches -> Add rule sobre main
+#     -> Require status checks to pass before merging -> elegir "pytest"
+#
+# Sin ese paso, el tilde rojo aparece y cualquiera puede mergear igual.
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Se instalan los DOS archivos: las dependencias de produccion mas las
+      # de desarrollo. Es el unico lugar donde hace falta pytest, y por eso es
+      # el unico lugar donde se instala.
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      # Sin DATABASE_URL definida, la API arranca sin historial y los tests
+      # verifican justamente ese camino. No hace falta levantar un Postgres
+      # para correr la suite, y eso es una consecuencia directa de haber
+      # diseñado la persistencia como opcional.
+      - name: Correr los tests
+        run: pytest -q

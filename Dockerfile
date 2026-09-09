@@ -16,10 +16,25 @@ WORKDIR /app
 # Si copiaras todo junto, cualquier cambio de una coma en main.py invalidaria
 # la capa y volveria a bajar TODAS las dependencias de internet.
 # Asi, mientras no toques requirements.txt, el pip install sale del cache.
+#
+# Fijate que NO copiamos requirements-dev.txt. pytest y httpx solo hacen falta
+# para correr los tests, y los tests no se corren en el servidor: se corren en
+# la integracion continua, antes de llegar hasta aca. Todo lo que metas en la
+# imagen es peso y superficie de ataque.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Los archivos de la aplicacion, uno por uno y a proposito.
+#
+# Podria ser `COPY . .` y seria mas corto, pero entonces cualquier archivo
+# suelto de la carpeta —un .env con credenciales, un dump de la base, notas
+# personales— se iria adentro de la imagen sin que nadie se entere. Y una vez
+# que entro a una capa, borrarlo en una linea posterior NO lo elimina: la capa
+# anterior sigue ahi y es recuperable.
+#
+# Nombrar lo que entra es mas trabajo y es la opcion correcta.
 COPY main.py .
+COPY db.py .
 
 # Documenta que la app escucha en el 8000. No abre nada por si solo: es una
 # anotacion para quien lea la receta y para Easypanel.
